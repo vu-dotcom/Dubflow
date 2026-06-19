@@ -91,6 +91,15 @@ const EDGE_TTS_VOICES = {
     'punjabi':    'pa-IN-OjasNeural'
 };
 
+// XTTS v2 supported language codes — clones the speaker's voice from a reference WAV
+const XTTS_LANGUAGE_CODES = {
+    'english':    'en', 'spanish':   'es', 'french':    'fr', 'german':    'de',
+    'italian':    'it', 'portuguese':'pt', 'polish':    'pl', 'turkish':   'tr',
+    'russian':    'ru', 'dutch':     'nl', 'czech':     'cs', 'arabic':    'ar',
+    'japanese':   'ja', 'hungarian': 'hu', 'korean':    'ko', 'hindi':     'hi',
+    'chinese': 'zh-cn', 'chinese simplified': 'zh-cn', 'chinese traditional': 'zh-cn',
+};
+
 // Any language with a TTS voice can be dubbed (even without translation support)
 const SUPPORTED_LANGUAGES = new Set(Object.keys(EDGE_TTS_VOICES));
 
@@ -179,6 +188,61 @@ const generateAudio = async (text, language, outputPath) => {
         return mp3Path;
     } finally {
         await fs.unlink(textFile).catch(() => {});
+    }
+};
+
+// Extract a short mono WAV clip from the video for XTTS speaker reference
+const extractSpeakerRef = async (videoPath, tempDir) => {
+    const refPath = path.join(tempDir, 'speaker_ref.wav');
+    // Skip first 5s to avoid intros/music; take up to 20s of clean speech
+    try {
+        await execAsync(
+            `"${ffmpegPath}" -y -ss 5 -i "${videoPath}" -vn -acodec pcm_s16le -ar 22050 -ac 1 -t 20 "${refPath}"`
+        );
+    } catch {
+        // Video shorter than 5s — take from the beginning
+        await execAsync(
+            `"${ffmpegPath}" -y -i "${videoPath}" -vn -acodec pcm_s16le -ar 22050 -ac 1 -t 20 "${refPath}"`
+        );
+    }
+    return refPath;
+};
+
+// Run XTTS v2 on all segments at once (model loads once → much faster than per-segment)
+// Returns a map of segment index → output WAV path for successfully synthesised segments
+const batchGenerateAudioXTTS = async (segments, speakerRef, xttsLang, tempDir) => {
+    const segData = segments
+        .map((seg, i) => ({
+            text:   (seg.translatedText || seg.text || '').trim(),
+            output: path.join(tempDir, `line_${i}.wav`),
+            index:  i,
+        }))
+        .filter(s => s.text.length >= 2);
+
+    if (segData.length === 0) return {};
+
+    const segFile = path.join(tempDir, 'xtts_segments.json');
+    await fs.writeFile(segFile, JSON.stringify(segData), 'utf8');
+
+    try {
+        console.log(`[XTTS] Synthesising ${segData.length} segments in "${xttsLang}" with cloned voice...`);
+        const { stdout } = await execAsync(
+            `python3 "${path.join(__dirname, 'xtts_helper.py')}" "${segFile}" "${xttsLang}" "${speakerRef}"`,
+            { timeout: 900000 } // 15 min — model download on first run
+        );
+        console.log('[XTTS]', stdout.trim());
+
+        const done = {};
+        for (const seg of segData) {
+            try { await fs.access(seg.output); done[seg.index] = seg.output; } catch {}
+        }
+        console.log(`[XTTS] ${Object.keys(done).length}/${segData.length} segments generated`);
+        return done;
+    } catch (err) {
+        console.error('[XTTS] Batch failed:', err.message);
+        return {};
+    } finally {
+        await fs.unlink(segFile).catch(() => {});
     }
 };
 
@@ -343,9 +407,46 @@ const runDubbingJob = async (jobId, videoId, targetLanguage) => {
         // Store transcript data for the viewer endpoint
         updateJob(jobId, { transcriptData: translatedTranscript });
 
-        // Step 3: Generate audio clips
+        // Step 3: Download video (needed before audio — XTTS uses its audio as speaker reference)
+        updateJob(jobId, { step: 'downloading_video' });
+        console.log(`[${jobId}] 📥 Downloading video...`);
+
+        const videoPath = path.join(tempDir, 'video.mp4');
+
+        try {
+            await downloadVideoOnly(videoId, videoPath);
+        } catch (dlError) {
+            console.error(`[${jobId}] yt-dlp failed, trying youtube-dl:`, dlError.message);
+            try {
+                await downloadVideoWithYoutubeDl(videoId, videoPath);
+            } catch (fallbackError) {
+                updateJob(jobId, {
+                    status: 'failed',
+                    error: `Video download failed: ${dlError.message}`
+                });
+                scheduleJobCleanup(jobId, tempDir, 5 * 60 * 1000);
+                return;
+            }
+        }
+
+        // Step 4: Generate audio clips (XTTS voice clone if supported, edge-tts fallback)
         updateJob(jobId, { step: 'generating_audio' });
         console.log(`[${jobId}] 🔊 Generating audio...`);
+
+        const xttsLang = XTTS_LANGUAGE_CODES[targetLanguage.toLowerCase()];
+        let xttsResults = {};
+
+        if (xttsLang) {
+            try {
+                console.log(`[${jobId}] 🎙️ Extracting speaker reference for voice cloning...`);
+                const speakerRef = await extractSpeakerRef(videoPath, tempDir);
+                xttsResults = await batchGenerateAudioXTTS(translatedTranscript, speakerRef, xttsLang, tempDir);
+            } catch (xttsErr) {
+                console.error(`[${jobId}] XTTS setup failed, falling back to edge-tts:`, xttsErr.message);
+            }
+        } else {
+            console.log(`[${jobId}] XTTS doesn't support ${targetLanguage} — using edge-tts`);
+        }
 
         const audioClips = [];
 
@@ -354,13 +455,18 @@ const runDubbingJob = async (jobId, videoId, targetLanguage) => {
 
             if (!item.translatedText || item.translatedText.trim().length < 2) continue;
 
-            const audioPath = path.join(tempDir, `line_${i}.mp3`);
+            // Use XTTS cloned voice if available for this segment
+            if (xttsResults[i]) {
+                audioClips.push({ path: xttsResults[i], start: item.start, duration: item.duration, index: i });
+                continue;
+            }
 
+            // Fall back to edge-tts (generic voice)
+            const audioPath = path.join(tempDir, `line_${i}.mp3`);
             try {
                 await generateAudio(item.translatedText, targetLanguage, audioPath);
                 audioClips.push({ path: audioPath, start: item.start, duration: item.duration, index: i });
             } catch {
-                // Fallback to silence for this segment
                 try {
                     const silencePath = path.join(tempDir, `silence_${i}.mp3`);
                     await createSilence(Math.max(item.duration, 0.5), silencePath);
@@ -405,28 +511,6 @@ const runDubbingJob = async (jobId, videoId, targetLanguage) => {
             console.error(`[${jobId}] Concatenation failed, using silence fallback:`, concatError.message);
             const totalDuration = Math.max(...audioClips.map(c => c.start + c.duration));
             await createSilence(totalDuration || 10, finalAudioPath);
-        }
-
-        // Step 4: Download video
-        updateJob(jobId, { step: 'downloading_video' });
-        console.log(`[${jobId}] 📥 Downloading video...`);
-
-        const videoPath = path.join(tempDir, 'video.mp4');
-
-        try {
-            await downloadVideoOnly(videoId, videoPath);
-        } catch (dlError) {
-            console.error(`[${jobId}] yt-dlp failed, trying youtube-dl:`, dlError.message);
-            try {
-                await downloadVideoWithYoutubeDl(videoId, videoPath);
-            } catch (fallbackError) {
-                updateJob(jobId, {
-                    status: 'failed',
-                    error: `Video download failed: ${dlError.message}`
-                });
-                scheduleJobCleanup(jobId, tempDir, 5 * 60 * 1000);
-                return;
-            }
         }
 
         // Step 5: Merge

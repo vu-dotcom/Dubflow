@@ -6,11 +6,11 @@ import { Play, Download, Globe, Zap, CheckCircle, AlertCircle, Loader2, ChevronD
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 const STEPS = [
-  { key: 'fetching_transcript', label: 'Extracting transcript' },
-  { key: 'translating',         label: 'Translating content'  },
-  { key: 'generating_audio',    label: 'Generating audio'     },
-  { key: 'downloading_video',   label: 'Downloading video'    },
-  { key: 'merging',             label: 'Merging video'        },
+  { key: 'fetching_transcript', label: 'Extracting transcript'           },
+  { key: 'translating',         label: 'Translating content'             },
+  { key: 'downloading_video',   label: 'Downloading video'               },
+  { key: 'generating_audio',    label: 'Cloning voice & generating audio' },
+  { key: 'merging',             label: 'Merging video'                   },
 ];
 
 interface DubResult {
