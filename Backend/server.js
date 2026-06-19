@@ -8,6 +8,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 ffmpeg.setFfmpegPath(ffmpegPath);
 const axios = require('axios');
+const { translate } = require('@vitalets/google-translate-api');
 const gTTS = require('gtts');
 const { v4: uuidv4 } = require('uuid');
 const { exec } = require('child_process');
@@ -23,7 +24,7 @@ app.use(cors());
 app.use(express.json());
 app.use('/downloads', express.static(path.join(__dirname, 'downloads')));
 
-console.log('✅ MyMemory Translator ready (no API key required)');
+console.log('✅ Google Translate ready (no API key required)');
 
 // Shared language name → code mappings
 const BASE_LANGUAGE_CODES = {
@@ -96,29 +97,13 @@ const translateText = async (text, targetLanguage) => {
     const targetLangCode = TRANSLATION_LANGUAGE_CODES[targetLanguage.toLowerCase()] || targetLanguage.toLowerCase();
 
     try {
-        const response = await axios.get('https://api.mymemory.translated.net/get', {
-            params: {
-                q: text.trim(),
-                langpair: `en|${targetLangCode}`
-            },
-            timeout: 10000
-        });
-
-        const translated = response.data?.responseData?.translatedText;
-        if (translated && response.data?.responseStatus === 200) {
-            return translated;
-        }
-
-        // Quota exceeded
-        if (response.data?.quotaFinished) {
-            throw new Error('MyMemory daily quota exceeded. Try again tomorrow or register a free email at mymemory.translated.net for a higher limit.');
-        }
-
-        console.warn('Unexpected MyMemory response, using original text');
-        return text;
-
+        const result = await translate(text.trim(), { to: targetLangCode });
+        return result.text || text;
     } catch (error) {
-        if (error.message.includes('quota')) throw error;
+        // 429 means Google is throttling — surface it so batchTranslate can back off
+        if (error.name === 'TooManyRequestsError') {
+            throw error;
+        }
         console.error('Translation error:', error.message);
         return text;
     }
@@ -141,11 +126,13 @@ const batchTranslateText = async (textArray, targetLanguage, batchSize = 10) => 
                 try {
                     const translatedText = await translateText(item.text, targetLanguage);
                     results.push({ ...item, translatedText });
-                    await new Promise(resolve => setTimeout(resolve, 200));
+                    await new Promise(resolve => setTimeout(resolve, 300));
                 } catch (itemError) {
                     console.error(`Translation failed for item: "${item.text.substring(0, 50)}..."`, itemError.message);
                     results.push({ ...item, translatedText: item.text });
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    // Back off longer if Google is throttling
+                    const delay = itemError.name === 'TooManyRequestsError' ? 5000 : 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
                 }
             }
 
@@ -535,7 +522,7 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'OK',
         message: 'YouTube Dubbing API is running',
-        translateStatus: 'MyMemory (free, no key required)',
+        translateStatus: 'Google Translate (free, no key required)',
         activeJobs: jobs.size
     });
 });
@@ -549,7 +536,7 @@ ensureDownloadsDir().then(() => {
     app.listen(PORT, () => {
         console.log(`🚀 YouTube Dubbing API server running on port ${PORT}`);
         console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
-        console.log(`🌐 Translation: MyMemory (free, no API key required)`);
+        console.log(`🌐 Translation: Google Translate (free, no API key required)`);
     });
 });
 
