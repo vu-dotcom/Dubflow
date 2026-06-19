@@ -9,7 +9,6 @@ const ffmpegPath = require('ffmpeg-static');
 ffmpeg.setFfmpegPath(ffmpegPath);
 const axios = require('axios');
 const { translate } = require('@vitalets/google-translate-api');
-const gTTS = require('gtts');
 const { v4: uuidv4 } = require('uuid');
 const { exec } = require('child_process');
 const { promisify } = require('util');
@@ -47,10 +46,44 @@ const TRANSLATION_LANGUAGE_CODES = {
     'chinese traditional': 'zh-TW'
 };
 
-// gTTS uses 'zh' for all Chinese variants
-const GTTS_LANGUAGE_CODES = {
-    ...BASE_LANGUAGE_CODES,
-    'chinese': 'zh'
+// Edge TTS voice map — Microsoft Azure Neural voices, free via edge-tts
+const EDGE_TTS_VOICES = {
+    'spanish':    'es-ES-AlvaroNeural',
+    'french':     'fr-FR-HenriNeural',
+    'german':     'de-DE-ConradNeural',
+    'italian':    'it-IT-DiegoNeural',
+    'portuguese': 'pt-BR-AntonioNeural',
+    'russian':    'ru-RU-DmitryNeural',
+    'japanese':   'ja-JP-KeitaNeural',
+    'korean':     'ko-KR-InJoonNeural',
+    'chinese':    'zh-CN-YunxiNeural',
+    'chinese simplified':  'zh-CN-YunxiNeural',
+    'chinese traditional': 'zh-TW-YunJheNeural',
+    'hindi':      'hi-IN-MadhurNeural',
+    'arabic':     'ar-SA-HamedNeural',
+    'dutch':      'nl-NL-MaartenNeural',
+    'polish':     'pl-PL-MarekNeural',
+    'turkish':    'tr-TR-AhmetNeural',
+    'swedish':    'sv-SE-MattiasNeural',
+    'norwegian':  'nb-NO-FinnNeural',
+    'danish':     'da-DK-JeppeNeural',
+    'finnish':    'fi-FI-HarriNeural',
+    'greek':      'el-GR-NestorasNeural',
+    'hebrew':     'he-IL-AvriNeural',
+    'thai':       'th-TH-NiwatNeural',
+    'vietnamese': 'vi-VN-NamMinhNeural',
+    'indonesian': 'id-ID-ArdiNeural',
+    'malay':      'ms-MY-OsmanNeural',
+    'tagalog':    'fil-PH-AngeloNeural',
+    'urdu':       'ur-PK-AsadNeural',
+    'bengali':    'bn-IN-BashkarNeural',
+    'tamil':      'ta-IN-ValluvarNeural',
+    'telugu':     'te-IN-MohanNeural',
+    'marathi':    'mr-IN-ManoharNeural',
+    'gujarati':   'gu-IN-NiranjanNeural',
+    'kannada':    'kn-IN-GaganNeural',
+    'malayalam':  'ml-IN-MidhunNeural',
+    'punjabi':    'pa-IN-OjasNeural'
 };
 
 const SUPPORTED_LANGUAGES = new Set(Object.keys(TRANSLATION_LANGUAGE_CODES));
@@ -151,37 +184,39 @@ const batchTranslateText = async (textArray, targetLanguage, batchSize = 10) => 
 };
 
 const generateAudio = async (text, language, outputPath) => {
-    return new Promise((resolve, reject) => {
-        if (!text || text.trim().length < 2) {
-            return reject(new Error('Text too short for TTS'));
-        }
+    if (!text || text.trim().length < 2) {
+        throw new Error('Text too short for TTS');
+    }
 
-        const langCode = GTTS_LANGUAGE_CODES[language.toLowerCase()] || 'en';
+    const voice = EDGE_TTS_VOICES[language.toLowerCase()] || 'en-US-ChristopherNeural';
+    const mp3Path = outputPath.replace(/\.wav$/, '.mp3');
 
-        try {
-            const gtts = new gTTS(text.trim(), langCode);
-            gtts.save(outputPath, (err) => {
-                if (err) { console.error('gTTS error:', err); reject(err); }
-                else resolve(outputPath);
-            });
-        } catch (error) {
-            console.error('gTTS creation error:', error);
-            reject(error);
-        }
-    });
+    // Write text to a temp file to safely handle special characters
+    const textFile = outputPath + '.txt';
+    await fs.writeFile(textFile, text.trim(), 'utf8');
+
+    try {
+        await execAsync(`python3 "${path.join(__dirname, 'tts_helper.py')}" "${textFile}" "${voice}" "${mp3Path}"`);
+        await fs.access(mp3Path);
+        return mp3Path;
+    } finally {
+        await fs.unlink(textFile).catch(() => {});
+    }
 };
 
 const createSilence = async (duration, outputPath) => {
     return new Promise((resolve, reject) => {
         const safeDuration = Math.max(0.1, Math.min(duration, 3600));
+        const mp3Path = outputPath.replace(/\.wav$/, '.mp3');
 
         ffmpeg()
-            .input('anullsrc=channel_layout=stereo:sample_rate=22050')
+            .input('anullsrc=channel_layout=stereo:sample_rate=24000')
             .inputFormat('lavfi')
             .duration(safeDuration)
-            .audioCodec('pcm_s16le')
-            .output(outputPath)
-            .on('end', () => resolve(outputPath))
+            .audioCodec('libmp3lame')
+            .audioBitrate('128k')
+            .output(mp3Path)
+            .on('end', () => resolve(mp3Path))
             .on('error', (err) => { console.error('Silence creation error:', err); reject(err); })
             .run();
     });
@@ -341,7 +376,7 @@ const runDubbingJob = async (jobId, videoId, targetLanguage) => {
 
             if (!item.translatedText || item.translatedText.trim().length < 2) continue;
 
-            const audioPath = path.join(tempDir, `line_${i}.wav`);
+            const audioPath = path.join(tempDir, `line_${i}.mp3`);
 
             try {
                 await generateAudio(item.translatedText, targetLanguage, audioPath);
@@ -349,7 +384,7 @@ const runDubbingJob = async (jobId, videoId, targetLanguage) => {
             } catch {
                 // Fallback to silence for this segment
                 try {
-                    const silencePath = path.join(tempDir, `silence_${i}.wav`);
+                    const silencePath = path.join(tempDir, `silence_${i}.mp3`);
                     await createSilence(Math.max(item.duration, 0.5), silencePath);
                     audioClips.push({ path: silencePath, start: item.start, duration: item.duration, index: i });
                 } catch (silenceError) {
@@ -373,7 +408,7 @@ const runDubbingJob = async (jobId, videoId, targetLanguage) => {
             const clip = audioClips[i];
 
             if (clip.start > currentTime + 0.1) {
-                const silencePath = path.join(tempDir, `gap_${i}.wav`);
+                const silencePath = path.join(tempDir, `gap_${i}.mp3`);
                 try {
                     await createSilence(clip.start - currentTime, silencePath);
                     alignedAudioFiles.push(silencePath);
@@ -384,7 +419,7 @@ const runDubbingJob = async (jobId, videoId, targetLanguage) => {
             currentTime = clip.start + clip.duration;
         }
 
-        const finalAudioPath = path.join(tempDir, 'final_audio.wav');
+        const finalAudioPath = path.join(tempDir, 'final_audio.mp3');
 
         try {
             await concatenateAudio(alignedAudioFiles, finalAudioPath);
