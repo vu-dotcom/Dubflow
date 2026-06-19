@@ -1,80 +1,176 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Play, Download, Globe, Zap, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
+const STEPS = [
+  { key: 'fetching_transcript', label: 'Extracting transcript' },
+  { key: 'translating',         label: 'Translating content'  },
+  { key: 'generating_audio',    label: 'Generating audio'     },
+  { key: 'downloading_video',   label: 'Downloading video'    },
+  { key: 'merging',             label: 'Merging video'        },
+];
+
 interface DubResult {
-  message: string;
+  status: 'completed';
+  downloadUrl: string;
   transcriptSegments: number;
   translationErrors: number;
-  downloadUrl: string;
+}
+
+interface JobStatus {
+  status: 'processing' | 'completed' | 'failed';
+  step?: string;
+  downloadUrl?: string;
+  error?: string;
+  transcriptSegments?: number;
+  translationErrors?: number;
 }
 
 export default function YouTubeDubber() {
-  const [videoUrl, setVideoUrl] = useState('');
+  const [videoUrl, setVideoUrl]         = useState('');
   const [targetLanguage, setTargetLanguage] = useState('spanish');
-  const [isLoading, setIsLoading] = useState(false);
-  const [result, setResult] = useState<DubResult | null>(null);
-  const [error, setError] = useState('');
+  const [isLoading, setIsLoading]       = useState(false);
+  const [currentStep, setCurrentStep]   = useState<string | null>(null);
+  const [result, setResult]             = useState<DubResult | null>(null);
+  const [error, setError]               = useState('');
+  const [jobId, setJobId]               = useState<string | null>(null);
+  const pollRef                         = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const languages = [
-    { code: 'spanish', name: 'Spanish (Español)' },
-    { code: 'french', name: 'French (Français)' },
-    { code: 'german', name: 'German (Deutsch)' },
-    { code: 'italian', name: 'Italian (Italiano)' },
-    { code: 'portuguese', name: 'Portuguese (Português)' },
-    { code: 'russian', name: 'Russian (Русский)' },
-    { code: 'japanese', name: 'Japanese (日本語)' },
-    { code: 'korean', name: 'Korean (한국어)' },
-    { code: 'chinese', name: 'Chinese (中文)' },
-    { code: 'hindi', name: 'Hindi (हिंदी)' },
-    { code: 'arabic', name: 'Arabic (العربية)' },
-    { code: 'dutch', name: 'Dutch (Nederlands)' },
-    { code: 'polish', name: 'Polish (Polski)' },
-    { code: 'turkish', name: 'Turkish (Türkçe)' },
-    { code: 'thai', name: 'Thai (ไทย)' },
-    { code: 'vietnamese', name: 'Vietnamese (Tiếng Việt)' }
+    { code: 'spanish',    name: 'Spanish (Español)'       },
+    { code: 'french',     name: 'French (Français)'       },
+    { code: 'german',     name: 'German (Deutsch)'        },
+    { code: 'italian',    name: 'Italian (Italiano)'      },
+    { code: 'portuguese', name: 'Portuguese (Português)'  },
+    { code: 'russian',    name: 'Russian (Русский)'       },
+    { code: 'japanese',   name: 'Japanese (日本語)'        },
+    { code: 'korean',     name: 'Korean (한국어)'          },
+    { code: 'chinese',    name: 'Chinese (中文)'           },
+    { code: 'hindi',      name: 'Hindi (हिंदी)'            },
+    { code: 'arabic',     name: 'Arabic (العربية)'        },
+    { code: 'dutch',      name: 'Dutch (Nederlands)'      },
+    { code: 'polish',     name: 'Polish (Polski)'         },
+    { code: 'turkish',    name: 'Turkish (Türkçe)'        },
+    { code: 'thai',       name: 'Thai (ไทย)'              },
+    { code: 'vietnamese', name: 'Vietnamese (Tiếng Việt)' },
   ];
+
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+
+  // Start polling whenever we get a jobId
+  useEffect(() => {
+    if (!jobId) return;
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const response = await fetch(`${API_URL}/api/job-status/${jobId}`);
+
+        if (response.status === 404) {
+          stopPolling();
+          setError('Job not found — it may have expired. Please try again.');
+          setIsLoading(false);
+          return;
+        }
+
+        const data: JobStatus = await response.json();
+
+        if (data.status === 'completed') {
+          stopPolling();
+          setResult({
+            status: 'completed',
+            downloadUrl: data.downloadUrl!,
+            transcriptSegments: data.transcriptSegments ?? 0,
+            translationErrors: data.translationErrors ?? 0,
+          });
+          setCurrentStep(null);
+          setIsLoading(false);
+        } else if (data.status === 'failed') {
+          stopPolling();
+          setError(data.error || 'Dubbing job failed. Please try again.');
+          setCurrentStep(null);
+          setIsLoading(false);
+        } else {
+          setCurrentStep(data.step ?? null);
+        }
+      } catch {
+        // Network hiccup — keep polling
+      }
+    }, 3000);
+
+    return () => stopPolling();
+  }, [jobId]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
     setError('');
     setResult(null);
+    setCurrentStep(null);
+    setJobId(null);
 
     try {
       const response = await fetch(`${API_URL}/api/dub-video`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ videoUrl, targetLanguage })
+        body: JSON.stringify({ videoUrl, targetLanguage }),
       });
 
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.error || 'Failed to process video');
+        throw new Error(data.error || 'Failed to start dubbing job');
       }
 
-      setResult(data);
+      setJobId(data.jobId);
+      setCurrentStep('fetching_transcript');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.');
-    } finally {
       setIsLoading(false);
     }
   };
 
+  const handleDownload = async () => {
+    if (!jobId) return;
+    try {
+      const response = await fetch(`${API_URL}/api/download/${jobId}`);
+      if (!response.ok) throw new Error('File not available');
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'dubbed_video.mp4';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError('Download failed. The file may have expired — try dubbing again.');
+    }
+  };
+
   const resetForm = () => {
+    stopPolling();
     setVideoUrl('');
     setTargetLanguage('spanish');
     setResult(null);
     setError('');
+    setJobId(null);
+    setCurrentStep(null);
   };
+
+  const currentStepIndex = STEPS.findIndex(s => s.key === currentStep);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-violet-900 via-purple-900 to-indigo-900 relative overflow-hidden">
-      {/* Animated background elements */}
+      {/* Animated background */}
       <div className="absolute inset-0">
         <div className="absolute top-1/4 left-1/4 w-72 h-72 bg-purple-500/20 rounded-full blur-3xl animate-pulse"></div>
         <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-indigo-500/20 rounded-full blur-3xl animate-pulse delay-1000"></div>
@@ -96,7 +192,7 @@ export default function YouTubeDubber() {
           <div className="max-w-2xl mx-auto">
             <div className="backdrop-blur-xl bg-white/10 rounded-3xl p-8 shadow-2xl border border-white/20">
               <form onSubmit={handleSubmit} className="space-y-6">
-                {/* YouTube URL Input */}
+                {/* URL Input */}
                 <div>
                   <label className="block text-white text-sm font-medium mb-3">
                     🎬 YouTube Video URL
@@ -109,12 +205,13 @@ export default function YouTubeDubber() {
                       placeholder="https://www.youtube.com/watch?v=..."
                       className="w-full px-4 py-4 bg-white/10 border border-white/20 rounded-2xl text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-400 focus:border-transparent transition-all duration-300"
                       required
+                      disabled={isLoading}
                     />
                     <Play className="absolute right-4 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
                   </div>
                 </div>
 
-                {/* Language Selection */}
+                {/* Language Select */}
                 <div>
                   <label className="block text-white text-sm font-medium mb-3">
                     🌍 Target Language
@@ -123,7 +220,8 @@ export default function YouTubeDubber() {
                     <select
                       value={targetLanguage}
                       onChange={(e) => setTargetLanguage(e.target.value)}
-                      className="w-full px-4 py-4 bg-white/10 border border-white/20 rounded-2xl text-white focus:outline-none focus:ring-2 focus:ring-purple-400 focus:border-transparent transition-all duration-300 appearance-none"
+                      disabled={isLoading}
+                      className="w-full px-4 py-4 bg-white/10 border border-white/20 rounded-2xl text-white focus:outline-none focus:ring-2 focus:ring-purple-400 focus:border-transparent transition-all duration-300 appearance-none disabled:opacity-60"
                     >
                       {languages.map((lang) => (
                         <option key={lang.code} value={lang.code} className="bg-gray-800 text-white">
@@ -135,7 +233,7 @@ export default function YouTubeDubber() {
                   </div>
                 </div>
 
-                {/* Error Message */}
+                {/* Error */}
                 {error && (
                   <div className="flex items-center gap-3 p-4 bg-red-500/20 border border-red-500/30 rounded-2xl">
                     <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0" />
@@ -143,7 +241,7 @@ export default function YouTubeDubber() {
                   </div>
                 )}
 
-                {/* Submit Button */}
+                {/* Submit */}
                 <button
                   type="submit"
                   disabled={isLoading || !videoUrl.trim()}
@@ -164,49 +262,55 @@ export default function YouTubeDubber() {
               </form>
             </div>
 
-            {/* Loading Animation */}
+            {/* Live Progress */}
             {isLoading && (
               <div className="mt-8 backdrop-blur-xl bg-white/10 rounded-3xl p-8 shadow-2xl border border-white/20">
-                <div className="text-center">
-                  <div className="w-16 h-16 mx-auto mb-4">
-                    <div className="w-16 h-16 border-4 border-purple-400 border-t-transparent rounded-full animate-spin"></div>
-                  </div>
-                  <h3 className="text-xl font-semibold text-white mb-2">Creating Your Dubbed Video</h3>
-                  <p className="text-gray-300 mb-4">This may take a few minutes...</p>
+                <div className="text-center mb-6">
+                  <div className="w-16 h-16 mx-auto mb-4 border-4 border-purple-400 border-t-transparent rounded-full animate-spin"></div>
+                  <h3 className="text-xl font-semibold text-white mb-1">Creating Your Dubbed Video</h3>
+                  <p className="text-gray-400 text-sm">This takes a few minutes — hang tight</p>
+                </div>
 
-                  {/* Progress Steps */}
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-center gap-3 text-purple-300">
-                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse"></div>
-                      <span className="text-sm">Extracting transcript</span>
-                    </div>
-                    <div className="flex items-center justify-center gap-3 text-purple-300">
-                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-300"></div>
-                      <span className="text-sm">Translating content</span>
-                    </div>
-                    <div className="flex items-center justify-center gap-3 text-purple-300">
-                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-700"></div>
-                      <span className="text-sm">Generating audio</span>
-                    </div>
-                    <div className="flex items-center justify-center gap-3 text-purple-300">
-                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-1000"></div>
-                      <span className="text-sm">Merging video</span>
-                    </div>
-                  </div>
+                <div className="space-y-3">
+                  {STEPS.map((step, idx) => {
+                    const isDone    = currentStepIndex > idx;
+                    const isActive  = currentStepIndex === idx;
+                    const isPending = currentStepIndex < idx;
+
+                    return (
+                      <div
+                        key={step.key}
+                        className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-500 ${
+                          isActive  ? 'bg-purple-500/20 border border-purple-400/40' :
+                          isDone    ? 'opacity-60' : 'opacity-30'
+                        }`}
+                      >
+                        {isDone ? (
+                          <CheckCircle className="w-4 h-4 text-green-400 flex-shrink-0" />
+                        ) : isActive ? (
+                          <Loader2 className="w-4 h-4 text-purple-400 animate-spin flex-shrink-0" />
+                        ) : (
+                          <div className="w-4 h-4 rounded-full border border-gray-500 flex-shrink-0" />
+                        )}
+                        <span className={`text-sm ${isActive ? 'text-white font-medium' : 'text-gray-400'}`}>
+                          {step.label}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
           </div>
         ) : (
-          /* Results Section */
+          /* Results */
           <div className="max-w-4xl mx-auto">
             <div className="backdrop-blur-xl bg-white/10 rounded-3xl p-8 shadow-2xl border border-white/20">
-              {/* Success Message */}
               <div className="flex items-center gap-3 mb-6 p-4 bg-green-500/20 border border-green-500/30 rounded-2xl">
                 <CheckCircle className="w-6 h-6 text-green-400 flex-shrink-0" />
                 <div>
                   <h3 className="text-green-300 font-semibold">Success!</h3>
-                  <p className="text-green-200 text-sm">{result.message}</p>
+                  <p className="text-green-200 text-sm">Your video has been dubbed successfully.</p>
                 </div>
               </div>
 
@@ -239,6 +343,7 @@ export default function YouTubeDubber() {
               {/* Video Player */}
               <div className="mb-6">
                 <h3 className="text-xl font-semibold text-white mb-4">🎬 Your Dubbed Video</h3>
+                <p className="text-gray-400 text-xs mb-3">⏱ Available for 1 hour — download to keep it</p>
                 <div className="bg-black/50 rounded-2xl overflow-hidden border border-white/10">
                   <video
                     controls
@@ -250,16 +355,15 @@ export default function YouTubeDubber() {
                 </div>
               </div>
 
-              {/* Action Buttons */}
+              {/* Actions */}
               <div className="flex flex-col sm:flex-row gap-4">
-                <a
-                  href={`${API_URL}${result.downloadUrl}`}
-                  download
-                  className="flex-1 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold py-3 px-6 rounded-2xl transition-all duration-300 transform hover:scale-105 shadow-xl text-center flex items-center justify-center gap-2"
+                <button
+                  onClick={handleDownload}
+                  className="flex-1 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold py-3 px-6 rounded-2xl transition-all duration-300 transform hover:scale-105 shadow-xl flex items-center justify-center gap-2"
                 >
                   <Download className="w-5 h-5" />
                   Download Video
-                </a>
+                </button>
                 <button
                   onClick={resetForm}
                   className="flex-1 bg-white/10 hover:bg-white/20 text-white font-semibold py-3 px-6 rounded-2xl transition-all duration-300 border border-white/20 flex items-center justify-center gap-2"
@@ -272,7 +376,6 @@ export default function YouTubeDubber() {
           </div>
         )}
 
-        {/* Footer */}
         <div className="text-center mt-12">
           <p className="text-gray-400 text-sm">
             Powered by AI • Made with ❤️ for content creators

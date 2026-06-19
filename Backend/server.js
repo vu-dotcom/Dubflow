@@ -61,6 +61,27 @@ const GTTS_LANGUAGE_CODES = {
 
 const SUPPORTED_LANGUAGES = new Set(Object.keys(RAPIDAPI_LANGUAGE_CODES));
 
+// In-memory job store — each entry: { status, step, downloadUrl?, error?, transcriptSegments?, translationErrors?, tempDir }
+const jobs = new Map();
+
+const updateJob = (jobId, update) => {
+    const job = jobs.get(jobId);
+    if (job) jobs.set(jobId, { ...job, ...update });
+};
+
+// Delete job files after TTL; remove the entry from memory after failed jobs
+const scheduleJobCleanup = (jobId, tempDir, delayMs = 60 * 60 * 1000) => {
+    setTimeout(async () => {
+        try {
+            await fs.rm(tempDir, { recursive: true, force: true });
+            jobs.delete(jobId);
+            console.log(`🗑️  Cleaned up job ${jobId}`);
+        } catch (err) {
+            console.warn(`Cleanup failed for job ${jobId}:`, err.message);
+        }
+    }, delayMs);
+};
+
 const ensureDownloadsDir = async () => {
     const downloadsDir = path.join(__dirname, 'downloads');
     try {
@@ -82,9 +103,7 @@ const translateText = async (text, targetLanguage) => {
             throw new Error('RapidAPI Translator not initialized. Please check your API key.');
         }
 
-        if (!text || text.trim().length < 2) {
-            return text;
-        }
+        if (!text || text.trim().length < 2) return text;
 
         const targetLangCode = RAPIDAPI_LANGUAGE_CODES[targetLanguage.toLowerCase()] || targetLanguage.toLowerCase();
 
@@ -96,12 +115,7 @@ const translateText = async (text, targetLanguage) => {
                 'x-rapidapi-host': RAPIDAPI_HOST,
                 'Content-Type': 'application/json'
             },
-            data: {
-                q: text.trim(),
-                source: 'auto',
-                target: targetLangCode,
-                format: 'text'
-            },
+            data: { q: text.trim(), source: 'auto', target: targetLangCode, format: 'text' },
             timeout: 10000
         });
 
@@ -116,7 +130,7 @@ const translateText = async (text, targetLanguage) => {
         console.error('RapidAPI Translation error:', error.message);
 
         if (error.response) {
-            const status = error.response.status;
+            const { status } = error.response;
             if (status === 401) throw new Error('Invalid RapidAPI key. Please check your credentials.');
             if (status === 429) throw new Error('RapidAPI rate limit exceeded. Please check your subscription plan.');
             if (status === 403) throw new Error('RapidAPI access forbidden. Please check your subscription and permissions.');
@@ -180,12 +194,8 @@ const generateAudio = async (text, language, outputPath) => {
         try {
             const gtts = new gTTS(text.trim(), langCode);
             gtts.save(outputPath, (err) => {
-                if (err) {
-                    console.error('gTTS error:', err);
-                    reject(err);
-                } else {
-                    resolve(outputPath);
-                }
+                if (err) { console.error('gTTS error:', err); reject(err); }
+                else resolve(outputPath);
             });
         } catch (error) {
             console.error('gTTS creation error:', error);
@@ -204,14 +214,8 @@ const createSilence = async (duration, outputPath) => {
             .duration(safeDuration)
             .audioCodec('pcm_s16le')
             .output(outputPath)
-            .on('end', () => {
-                console.log(`Created silence: ${safeDuration}s -> ${outputPath}`);
-                resolve(outputPath);
-            })
-            .on('error', (err) => {
-                console.error('Silence creation error:', err);
-                reject(err);
-            })
+            .on('end', () => resolve(outputPath))
+            .on('error', (err) => { console.error('Silence creation error:', err); reject(err); })
             .run();
     });
 };
@@ -242,36 +246,27 @@ const concatenateAudio = async (audioFiles, outputPath) => {
             .outputOptions(['-map', '[out]'])
             .output(outputPath)
             .on('end', () => resolve(outputPath))
-            .on('error', (err) => {
-                console.error('FFmpeg concatenation error:', err);
-                reject(err);
-            })
+            .on('error', (err) => { console.error('FFmpeg concatenation error:', err); reject(err); })
             .run();
     });
 };
 
 const downloadVideoOnly = async (videoId, outputPath) => {
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
     try {
-        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-        const command = `yt-dlp -f "bestvideo[ext=mp4]" --no-audio -o "${outputPath}" "${videoUrl}"`;
-
-        console.log('Executing:', command);
-        const { stderr } = await execAsync(command);
-
-        if (stderr && !stderr.includes('WARNING')) {
-            console.error('yt-dlp stderr:', stderr);
-        }
-
+        const { stderr } = await execAsync(
+            `yt-dlp -f "bestvideo[ext=mp4]" --no-audio --socket-timeout 30 -o "${outputPath}" "${videoUrl}"`
+        );
+        if (stderr && !stderr.includes('WARNING')) console.error('yt-dlp stderr:', stderr);
         await fs.access(outputPath);
         return outputPath;
     } catch (error) {
         console.error('yt-dlp error:', error);
-
-        // Fallback: try with a different format selector
+        // Fallback format selector
         try {
-            const fallbackCommand = `yt-dlp -f "best[ext=mp4]" --no-audio -o "${outputPath}" "https://www.youtube.com/watch?v=${videoId}"`;
-            console.log('Trying fallback:', fallbackCommand);
-            await execAsync(fallbackCommand);
+            await execAsync(
+                `yt-dlp -f "best[ext=mp4]" --no-audio --socket-timeout 30 -o "${outputPath}" "${videoUrl}"`
+            );
             await fs.access(outputPath);
             return outputPath;
         } catch (fallbackError) {
@@ -282,11 +277,9 @@ const downloadVideoOnly = async (videoId, outputPath) => {
 
 const downloadVideoWithYoutubeDl = async (videoId, outputPath) => {
     try {
-        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-        const command = `youtube-dl -f "bestvideo[ext=mp4]" --no-audio -o "${outputPath}" "${videoUrl}"`;
-
-        console.log('Executing youtube-dl:', command);
-        await execAsync(command);
+        await execAsync(
+            `youtube-dl -f "bestvideo[ext=mp4]" --no-audio -o "${outputPath}" "https://www.youtube.com/watch?v=${videoId}"`
+        );
         await fs.access(outputPath);
         return outputPath;
     } catch (error) {
@@ -307,7 +300,7 @@ const mergeVideoAudio = async (videoPath, audioPath, outputPath) => {
     });
 };
 
-// Delete intermediate files from the temp dir, keeping only the final video
+// Delete everything in tempDir except keepFile
 const cleanupTempFiles = async (tempDir, keepFile) => {
     try {
         const files = await fs.readdir(tempDir);
@@ -316,86 +309,43 @@ const cleanupTempFiles = async (tempDir, keepFile) => {
                 .filter(f => path.join(tempDir, f) !== keepFile)
                 .map(f => fs.unlink(path.join(tempDir, f)).catch(() => {}))
         );
-        console.log('🧹 Temp files cleaned up');
+        console.log('🧹 Intermediate files cleaned up');
     } catch (err) {
         console.warn('Cleanup warning:', err.message);
     }
 };
 
-app.post('/api/check-transcript', async (req, res) => {
-    const { videoUrl } = req.body;
+// Background dubbing pipeline — updates job store at each step
+const runDubbingJob = async (jobId, videoId, targetLanguage) => {
+    const tempDir = path.join(__dirname, 'downloads', jobId);
 
     try {
-        const videoId = extractVideoId(videoUrl);
-        if (!videoId) {
-            return res.status(400).json({ error: 'Invalid YouTube URL' });
-        }
+        await fs.mkdir(tempDir, { recursive: true });
 
-        console.log(`🔍 Checking transcript for video: ${videoId}`);
-        const result = await validateTranscriptAvailability(videoId);
-        res.json(result);
-    } catch (error) {
-        console.error('Error checking transcript:', error);
-        res.status(500).json({
-            error: 'Failed to check transcript availability',
-            details: error.message
-        });
-    }
-});
-
-app.post('/api/dub-video', async (req, res) => {
-    const { videoUrl, targetLanguage } = req.body;
-    const jobId = uuidv4();
-
-    try {
-        await ensureDownloadsDir();
-
-        console.log('🎬 Starting dubbing process...');
-
-        const videoId = extractVideoId(videoUrl);
-        if (!videoId) {
-            return res.status(400).json({ error: 'Invalid YouTube URL' });
-        }
-
-        if (!targetLanguage || !SUPPORTED_LANGUAGES.has(targetLanguage.toLowerCase())) {
-            return res.status(400).json({
-                error: `Unsupported language: "${targetLanguage}"`,
-                supported: [...SUPPORTED_LANGUAGES]
-            });
-        }
-
-        console.log('📹 Video ID extracted:', videoId);
-        console.log('📝 Fetching transcript with enhanced reliability...');
+        // Step 1: Fetch transcript
+        updateJob(jobId, { step: 'fetching_transcript' });
+        console.log(`[${jobId}] 📝 Fetching transcript...`);
 
         let transcript;
         try {
             transcript = await fetchTranscript(videoId);
         } catch (transcriptError) {
-            console.error('❌ Enhanced transcript fetching failed:', transcriptError.message);
-            return res.status(400).json({
-                error: 'Transcript fetching failed',
-                details: transcriptError.message,
-                suggestions: [
-                    'Try a different video with manual captions',
-                    'Check if the video has auto-generated captions enabled',
-                    'Ensure the video is publicly accessible',
-                    'Try again in a few minutes - YouTube may be rate limiting'
-                ]
-            });
+            updateJob(jobId, { status: 'failed', error: transcriptError.message });
+            scheduleJobCleanup(jobId, tempDir, 5 * 60 * 1000);
+            return;
         }
 
         if (!transcript || transcript.length === 0) {
-            return res.status(400).json({
-                error: 'Empty transcript',
-                details: 'The transcript was fetched but contains no content',
-                suggestions: ['Try a different video with spoken content and captions']
-            });
+            updateJob(jobId, { status: 'failed', error: 'The transcript was fetched but contains no content.' });
+            scheduleJobCleanup(jobId, tempDir, 5 * 60 * 1000);
+            return;
         }
 
-        console.log(`✅ Successfully fetched ${transcript.length} transcript segments`);
-        console.log('Transcript preview:', transcript.slice(0, 3).map(t => t.text).join(' '));
+        console.log(`[${jobId}] ✅ Fetched ${transcript.length} transcript segments`);
 
-        console.log('🌐 Translating transcript using RapidAPI Google Translator...');
+        // Step 2: Translate
+        updateJob(jobId, { step: 'translating' });
+        console.log(`[${jobId}] 🌐 Translating...`);
 
         let translatedTranscript;
         let translationErrors = 0;
@@ -405,150 +355,199 @@ app.post('/api/dub-video', async (req, res) => {
             translationErrors = translatedTranscript.filter(item =>
                 item.text === item.translatedText && item.text.trim().length >= 2
             ).length;
-            console.log(`✅ Translation completed. ${translationErrors} items unchanged.`);
-        } catch (translateError) {
-            console.error('❌ Batch translation failed:', translateError.message);
+        } catch {
             translatedTranscript = transcript.map(item => ({ ...item, translatedText: item.text }));
             translationErrors = transcript.length;
         }
 
-        if (translationErrors > 0) {
-            console.warn(`⚠️ ${translationErrors} translation issues occurred. Some text may be in original language.`);
-        }
+        // Step 3: Generate audio clips
+        updateJob(jobId, { step: 'generating_audio' });
+        console.log(`[${jobId}] 🔊 Generating audio...`);
 
-        console.log('🔊 Generating audio clips...');
         const audioClips = [];
-        const tempDir = path.join(__dirname, 'downloads', jobId);
-        await fs.mkdir(tempDir, { recursive: true });
-
-        let successfulClips = 0;
 
         for (let i = 0; i < translatedTranscript.length; i++) {
             const item = translatedTranscript[i];
 
-            if (!item.translatedText || item.translatedText.trim().length < 2) {
-                console.log(`Skipping empty/short text at line ${i}`);
-                continue;
-            }
+            if (!item.translatedText || item.translatedText.trim().length < 2) continue;
 
             const audioPath = path.join(tempDir, `line_${i}.wav`);
 
             try {
                 await generateAudio(item.translatedText, targetLanguage, audioPath);
                 audioClips.push({ path: audioPath, start: item.start, duration: item.duration, index: i });
-                successfulClips++;
-                console.log(`Generated audio ${successfulClips}/${translatedTranscript.length}`);
-            } catch (audioError) {
-                console.error(`Error generating audio for line ${i}:`, audioError.message);
+            } catch {
+                // Fallback to silence for this segment
                 try {
-                    const silenceDuration = Math.max(item.duration, 0.5);
                     const silencePath = path.join(tempDir, `silence_${i}.wav`);
-                    await createSilence(silenceDuration, silencePath);
-                    audioClips.push({ path: silencePath, start: item.start, duration: silenceDuration, index: i });
-                    successfulClips++;
+                    await createSilence(Math.max(item.duration, 0.5), silencePath);
+                    audioClips.push({ path: silencePath, start: item.start, duration: item.duration, index: i });
                 } catch (silenceError) {
-                    console.error(`Failed to create silence for line ${i}:`, silenceError.message);
+                    console.error(`[${jobId}] Failed to create silence for line ${i}:`, silenceError.message);
                 }
             }
         }
 
         if (audioClips.length === 0) {
-            throw new Error('No audio clips were generated successfully. Please check the transcript and try again.');
+            updateJob(jobId, { status: 'failed', error: 'No audio clips could be generated.' });
+            scheduleJobCleanup(jobId, tempDir, 5 * 60 * 1000);
+            return;
         }
 
-        console.log(`Successfully generated ${audioClips.length} audio clips`);
-
-        console.log('⏰ Aligning audio with timestamps...');
-        const alignedAudioFiles = [];
-
+        // Build aligned audio track
         audioClips.sort((a, b) => a.start - b.start);
-
+        const alignedAudioFiles = [];
         let currentTime = 0;
 
         for (let i = 0; i < audioClips.length; i++) {
             const clip = audioClips[i];
 
-            if (clip.start > currentTime) {
-                const silenceDuration = clip.start - currentTime;
-                if (silenceDuration > 0.1) {
-                    const silencePath = path.join(tempDir, `gap_${i}.wav`);
-                    try {
-                        await createSilence(silenceDuration, silencePath);
-                        alignedAudioFiles.push(silencePath);
-                    } catch (silenceError) {
-                        console.error('Failed to create gap silence:', silenceError.message);
-                    }
-                }
+            if (clip.start > currentTime + 0.1) {
+                const silencePath = path.join(tempDir, `gap_${i}.wav`);
+                try {
+                    await createSilence(clip.start - currentTime, silencePath);
+                    alignedAudioFiles.push(silencePath);
+                } catch { /* skip gap */ }
             }
 
             alignedAudioFiles.push(clip.path);
             currentTime = clip.start + clip.duration;
         }
 
-        if (alignedAudioFiles.length === 0) {
-            throw new Error('No aligned audio files were created. Audio generation failed.');
-        }
-
-        console.log('🔗 Concatenating audio clips...');
         const finalAudioPath = path.join(tempDir, 'final_audio.wav');
 
         try {
             await concatenateAudio(alignedAudioFiles, finalAudioPath);
         } catch (concatError) {
-            console.error('Concatenation failed, trying alternative method:', concatError.message);
-            const totalDuration = Math.max(...audioClips.map(clip => clip.start + clip.duration));
+            console.error(`[${jobId}] Concatenation failed, using silence fallback:`, concatError.message);
+            const totalDuration = Math.max(...audioClips.map(c => c.start + c.duration));
             await createSilence(totalDuration || 10, finalAudioPath);
         }
 
-        console.log('📥 Downloading video...');
+        // Step 4: Download video
+        updateJob(jobId, { step: 'downloading_video' });
+        console.log(`[${jobId}] 📥 Downloading video...`);
+
         const videoPath = path.join(tempDir, 'video.mp4');
 
         try {
             await downloadVideoOnly(videoId, videoPath);
-        } catch (error) {
-            console.error('yt-dlp failed, trying youtube-dl:', error.message);
+        } catch (dlError) {
+            console.error(`[${jobId}] yt-dlp failed, trying youtube-dl:`, dlError.message);
             try {
                 await downloadVideoWithYoutubeDl(videoId, videoPath);
             } catch (fallbackError) {
-                throw new Error(`Both yt-dlp and youtube-dl failed. Please ensure one of them is installed: ${error.message}`);
+                updateJob(jobId, {
+                    status: 'failed',
+                    error: `Video download failed: ${dlError.message}`
+                });
+                scheduleJobCleanup(jobId, tempDir, 5 * 60 * 1000);
+                return;
             }
         }
 
-        console.log('🎭 Merging video and audio...');
+        // Step 5: Merge
+        updateJob(jobId, { step: 'merging' });
+        console.log(`[${jobId}] 🎭 Merging video and audio...`);
+
         const finalVideoPath = path.join(tempDir, 'dubbed_video.mp4');
         await mergeVideoAudio(videoPath, finalAudioPath, finalVideoPath);
 
+        // Clean up intermediate files, keep only dubbed_video.mp4
         await cleanupTempFiles(tempDir, finalVideoPath);
 
-        console.log('✅ Dubbing completed successfully!');
+        // Schedule full directory cleanup after 1 hour
+        scheduleJobCleanup(jobId, tempDir, 60 * 60 * 1000);
 
-        res.json({
-            success: true,
-            jobId,
+        updateJob(jobId, {
+            status: 'completed',
+            step: 'completed',
             downloadUrl: `/downloads/${jobId}/dubbed_video.mp4`,
-            message: 'Video dubbed successfully using RapidAPI Google Translator!',
             transcriptSegments: transcript.length,
             translationErrors
         });
 
+        console.log(`[${jobId}] ✅ Dubbing completed!`);
+
     } catch (error) {
-        console.error('❌ Error during dubbing process:', error);
-        res.status(500).json({
-            error: 'Failed to dub video',
-            details: error.message
-        });
+        console.error(`[${jobId}] ❌ Unhandled error:`, error);
+        updateJob(jobId, { status: 'failed', error: error.message });
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+        // Keep the failed entry for 5 minutes so the frontend can read the error
+        setTimeout(() => jobs.delete(jobId), 5 * 60 * 1000);
+    }
+};
+
+// ─── Routes ──────────────────────────────────────────────────────────────────
+
+app.post('/api/check-transcript', async (req, res) => {
+    const { videoUrl } = req.body;
+    try {
+        const videoId = extractVideoId(videoUrl);
+        if (!videoId) return res.status(400).json({ error: 'Invalid YouTube URL' });
+
+        console.log(`🔍 Checking transcript for video: ${videoId}`);
+        const result = await validateTranscriptAvailability(videoId);
+        res.json(result);
+    } catch (error) {
+        console.error('Error checking transcript:', error);
+        res.status(500).json({ error: 'Failed to check transcript availability', details: error.message });
     }
 });
 
-app.get('/api/job-status/:jobId', async (req, res) => {
+// Returns immediately with jobId; processing runs in the background
+app.post('/api/dub-video', async (req, res) => {
+    const { videoUrl, targetLanguage } = req.body;
+
+    const videoId = extractVideoId(videoUrl);
+    if (!videoId) {
+        return res.status(400).json({ error: 'Invalid YouTube URL' });
+    }
+
+    if (!targetLanguage || !SUPPORTED_LANGUAGES.has(targetLanguage.toLowerCase())) {
+        return res.status(400).json({
+            error: `Unsupported language: "${targetLanguage}"`,
+            supported: [...SUPPORTED_LANGUAGES]
+        });
+    }
+
+    const jobId = uuidv4();
+    jobs.set(jobId, { status: 'processing', step: 'fetching_transcript', tempDir: path.join(__dirname, 'downloads', jobId) });
+
+    runDubbingJob(jobId, videoId, targetLanguage).catch(err => {
+        console.error('Unhandled job error:', err);
+        updateJob(jobId, { status: 'failed', error: err.message });
+    });
+
+    res.json({ jobId });
+});
+
+// Poll this to track progress
+app.get('/api/job-status/:jobId', (req, res) => {
+    const { jobId } = req.params;
+    const job = jobs.get(jobId);
+
+    if (!job) {
+        return res.status(404).json({ error: 'Job not found or already expired' });
+    }
+
+    // Don't expose internal tempDir to the client
+    const { tempDir, ...clientJob } = job;
+    res.json(clientJob);
+});
+
+// Serves the file with Content-Disposition: attachment so browsers download instead of open
+app.get('/api/download/:jobId', async (req, res) => {
     const { jobId } = req.params;
     const finalVideo = path.join(__dirname, 'downloads', jobId, 'dubbed_video.mp4');
 
     try {
         await fs.access(finalVideo);
-        res.json({ status: 'completed', downloadUrl: `/downloads/${jobId}/dubbed_video.mp4` });
+        res.setHeader('Content-Disposition', 'attachment; filename="dubbed_video.mp4"');
+        res.setHeader('Content-Type', 'video/mp4');
+        res.sendFile(finalVideo);
     } catch {
-        res.json({ status: 'processing' });
+        res.status(404).json({ error: 'File not found or already cleaned up' });
     }
 });
 
@@ -556,7 +555,8 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'OK',
         message: 'YouTube Dubbing API is running',
-        translateStatus: translatorAvailable ? 'RapidAPI Connected' : 'Not Connected'
+        translateStatus: translatorAvailable ? 'RapidAPI Connected' : 'Not Connected',
+        activeJobs: jobs.size
     });
 });
 
@@ -565,10 +565,12 @@ app.use((error, req, res, next) => {
     res.status(500).json({ error: 'Internal server error', details: error.message });
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 YouTube Dubbing API server running on port ${PORT}`);
-    console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
-    console.log(`🔑 RapidAPI Translator Status: ${translatorAvailable ? '✅ Connected' : '❌ Not Connected'}`);
+ensureDownloadsDir().then(() => {
+    app.listen(PORT, () => {
+        console.log(`🚀 YouTube Dubbing API server running on port ${PORT}`);
+        console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
+        console.log(`🔑 RapidAPI Translator Status: ${translatorAvailable ? '✅ Connected' : '❌ Not Connected'}`);
+    });
 });
 
 module.exports = app;
