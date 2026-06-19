@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { Play, Download, Globe, Zap, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { Play, Download, Globe, Zap, CheckCircle, AlertCircle, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
@@ -29,6 +29,13 @@ interface JobStatus {
   translationErrors?: number;
 }
 
+interface TranscriptSegment {
+  text: string;
+  translatedText: string;
+  start: number;
+  duration: number;
+}
+
 export default function YouTubeDubber() {
   const [videoUrl, setVideoUrl]         = useState('');
   const [targetLanguage, setTargetLanguage] = useState('spanish');
@@ -37,6 +44,8 @@ export default function YouTubeDubber() {
   const [result, setResult]             = useState<DubResult | null>(null);
   const [error, setError]               = useState('');
   const [jobId, setJobId]               = useState<string | null>(null);
+  const [transcript, setTranscript]     = useState<TranscriptSegment[]>([]);
+  const [showTranscript, setShowTranscript] = useState(false);
   const pollRef                         = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const languages = [
@@ -92,6 +101,11 @@ export default function YouTubeDubber() {
           });
           setCurrentStep(null);
           setIsLoading(false);
+          // Fetch transcript data for the viewer
+          fetch(`${API_URL}/api/job-transcript/${jobId}`)
+            .then(r => r.json())
+            .then(d => { if (d.segments) setTranscript(d.segments); })
+            .catch(() => {});
         } else if (data.status === 'failed') {
           stopPolling();
           setError(data.error || 'Dubbing job failed. Please try again.');
@@ -164,6 +178,14 @@ export default function YouTubeDubber() {
     setError('');
     setJobId(null);
     setCurrentStep(null);
+    setTranscript([]);
+    setShowTranscript(false);
+  };
+
+  const formatTime = (seconds: number) => {
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
   };
 
   const currentStepIndex = STEPS.findIndex(s => s.key === currentStep);
@@ -354,6 +376,53 @@ export default function YouTubeDubber() {
                   </video>
                 </div>
               </div>
+
+              {/* Transcript Viewer */}
+              {transcript.length > 0 && (
+                <div className="mb-6">
+                  <button
+                    onClick={() => setShowTranscript(!showTranscript)}
+                    className="w-full flex items-center justify-between px-4 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-white transition-all duration-200"
+                  >
+                    <span className="font-medium text-sm">📝 View Transcript & Translation</span>
+                    {showTranscript ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
+                  </button>
+
+                  {showTranscript && (
+                    <div className="mt-2 rounded-2xl border border-white/10 overflow-hidden">
+                      {/* Header */}
+                      <div className="grid grid-cols-12 gap-2 px-4 py-2 bg-white/5 border-b border-white/10 text-xs font-semibold text-gray-400 uppercase tracking-wide">
+                        <div className="col-span-1">Time</div>
+                        <div className="col-span-5">Original</div>
+                        <div className="col-span-6">Translation</div>
+                      </div>
+                      {/* Rows */}
+                      <div className="max-h-80 overflow-y-auto">
+                        {transcript.map((seg, i) => {
+                          const failed = seg.text.trim() === seg.translatedText?.trim();
+                          return (
+                            <div
+                              key={i}
+                              className={`grid grid-cols-12 gap-2 px-4 py-2 border-b border-white/5 text-sm ${
+                                failed ? 'bg-red-500/10' : 'hover:bg-white/5'
+                              }`}
+                            >
+                              <div className="col-span-1 text-gray-500 text-xs pt-0.5 tabular-nums">
+                                {formatTime(seg.start)}
+                              </div>
+                              <div className="col-span-5 text-gray-300">{seg.text}</div>
+                              <div className={`col-span-6 ${failed ? 'text-red-400 italic' : 'text-white'}`}>
+                                {seg.translatedText || <span className="text-gray-500">—</span>}
+                                {failed && <span className="ml-2 text-xs text-red-500">(not translated)</span>}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Actions */}
               <div className="flex flex-col sm:flex-row gap-4">

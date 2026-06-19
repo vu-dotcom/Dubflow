@@ -327,6 +327,9 @@ const runDubbingJob = async (jobId, videoId, targetLanguage) => {
             translationErrors = transcript.length;
         }
 
+        // Store transcript data for the viewer endpoint
+        updateJob(jobId, { transcriptData: translatedTranscript });
+
         // Step 3: Generate audio clips
         updateJob(jobId, { step: 'generating_audio' });
         console.log(`[${jobId}] 🔊 Generating audio...`);
@@ -498,9 +501,20 @@ app.get('/api/job-status/:jobId', (req, res) => {
         return res.status(404).json({ error: 'Job not found or already expired' });
     }
 
-    // Don't expose internal tempDir to the client
-    const { tempDir, ...clientJob } = job;
+    // Strip internal fields — transcriptData is served by its own endpoint
+    const { tempDir, transcriptData, ...clientJob } = job;
     res.json(clientJob);
+});
+
+// Returns the original + translated transcript for the viewer
+app.get('/api/job-transcript/:jobId', (req, res) => {
+    const { jobId } = req.params;
+    const job = jobs.get(jobId);
+
+    if (!job) return res.status(404).json({ error: 'Job not found or already expired' });
+    if (!job.transcriptData) return res.status(404).json({ error: 'Transcript not yet available' });
+
+    res.json({ segments: job.transcriptData });
 });
 
 // Serves the file with Content-Disposition: attachment so browsers download instead of open
