@@ -5,6 +5,8 @@ const cors = require('cors');
 const fs = require('fs').promises;
 const path = require('path');
 const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+ffmpeg.setFfmpegPath(ffmpegPath);
 const axios = require('axios');
 const gTTS = require('gtts');
 const { v4: uuidv4 } = require('uuid');
@@ -21,16 +23,7 @@ app.use(cors());
 app.use(express.json());
 app.use('/downloads', express.static(path.join(__dirname, 'downloads')));
 
-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
-const RAPIDAPI_HOST = 'google-translator9.p.rapidapi.com';
-
-let translatorAvailable = false;
-if (RAPIDAPI_KEY) {
-    translatorAvailable = true;
-    console.log('✅ RapidAPI Translator initialized');
-} else {
-    console.error('❌ RapidAPI key not found. Please set RAPIDAPI_KEY in your environment variables');
-}
+console.log('✅ MyMemory Translator ready (no API key required)');
 
 // Shared language name → code mappings
 const BASE_LANGUAGE_CODES = {
@@ -45,8 +38,8 @@ const BASE_LANGUAGE_CODES = {
     'punjabi': 'pa'
 };
 
-// Google Translate distinguishes zh-CN / zh-TW
-const RAPIDAPI_LANGUAGE_CODES = {
+// MyMemory uses zh-CN / zh-TW for Chinese variants
+const TRANSLATION_LANGUAGE_CODES = {
     ...BASE_LANGUAGE_CODES,
     'chinese': 'zh-CN',
     'chinese simplified': 'zh-CN',
@@ -59,7 +52,7 @@ const GTTS_LANGUAGE_CODES = {
     'chinese': 'zh'
 };
 
-const SUPPORTED_LANGUAGES = new Set(Object.keys(RAPIDAPI_LANGUAGE_CODES));
+const SUPPORTED_LANGUAGES = new Set(Object.keys(TRANSLATION_LANGUAGE_CODES));
 
 // In-memory job store — each entry: { status, step, downloadUrl?, error?, transcriptSegments?, translationErrors?, tempDir }
 const jobs = new Map();
@@ -98,54 +91,41 @@ const extractVideoId = (url) => {
 };
 
 const translateText = async (text, targetLanguage) => {
+    if (!text || text.trim().length < 2) return text;
+
+    const targetLangCode = TRANSLATION_LANGUAGE_CODES[targetLanguage.toLowerCase()] || targetLanguage.toLowerCase();
+
     try {
-        if (!translatorAvailable) {
-            throw new Error('RapidAPI Translator not initialized. Please check your API key.');
-        }
-
-        if (!text || text.trim().length < 2) return text;
-
-        const targetLangCode = RAPIDAPI_LANGUAGE_CODES[targetLanguage.toLowerCase()] || targetLanguage.toLowerCase();
-
-        const response = await axios.request({
-            method: 'POST',
-            url: 'https://google-translator9.p.rapidapi.com/v2',
-            headers: {
-                'x-rapidapi-key': RAPIDAPI_KEY,
-                'x-rapidapi-host': RAPIDAPI_HOST,
-                'Content-Type': 'application/json'
+        const response = await axios.get('https://api.mymemory.translated.net/get', {
+            params: {
+                q: text.trim(),
+                langpair: `en|${targetLangCode}`
             },
-            data: { q: text.trim(), source: 'auto', target: targetLangCode, format: 'text' },
             timeout: 10000
         });
 
-        if (response.data?.data?.translations?.length > 0) {
-            return response.data.data.translations[0].translatedText || text;
+        const translated = response.data?.responseData?.translatedText;
+        if (translated && response.data?.responseStatus === 200) {
+            return translated;
         }
 
-        console.warn('Unexpected response format from RapidAPI, using original text');
+        // Quota exceeded
+        if (response.data?.quotaFinished) {
+            throw new Error('MyMemory daily quota exceeded. Try again tomorrow or register a free email at mymemory.translated.net for a higher limit.');
+        }
+
+        console.warn('Unexpected MyMemory response, using original text');
         return text;
 
     } catch (error) {
-        console.error('RapidAPI Translation error:', error.message);
-
-        if (error.response) {
-            const { status } = error.response;
-            if (status === 401) throw new Error('Invalid RapidAPI key. Please check your credentials.');
-            if (status === 429) throw new Error('RapidAPI rate limit exceeded. Please check your subscription plan.');
-            if (status === 403) throw new Error('RapidAPI access forbidden. Please check your subscription and permissions.');
-        }
-
+        if (error.message.includes('quota')) throw error;
+        console.error('Translation error:', error.message);
         return text;
     }
 };
 
 const batchTranslateText = async (textArray, targetLanguage, batchSize = 10) => {
     try {
-        if (!translatorAvailable) {
-            throw new Error('RapidAPI Translator not initialized. Please check your API key.');
-        }
-
         const results = [];
 
         for (let i = 0; i < textArray.length; i += batchSize) {
@@ -255,17 +235,17 @@ const downloadVideoOnly = async (videoId, outputPath) => {
     const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
     try {
         const { stderr } = await execAsync(
-            `yt-dlp -f "bestvideo[ext=mp4]" --no-audio --socket-timeout 30 -o "${outputPath}" "${videoUrl}"`
+            `python3 -m yt_dlp --extractor-args "youtube:player_client=android" -f "bestvideo[ext=mp4]/best[ext=mp4]/best" --socket-timeout 30 -o "${outputPath}" "${videoUrl}"`
         );
         if (stderr && !stderr.includes('WARNING')) console.error('yt-dlp stderr:', stderr);
         await fs.access(outputPath);
         return outputPath;
     } catch (error) {
         console.error('yt-dlp error:', error);
-        // Fallback format selector
+        // Fallback: any available format
         try {
             await execAsync(
-                `yt-dlp -f "best[ext=mp4]" --no-audio --socket-timeout 30 -o "${outputPath}" "${videoUrl}"`
+                `python3 -m yt_dlp --extractor-args "youtube:player_client=android" -f "mp4/best" --socket-timeout 30 -o "${outputPath}" "${videoUrl}"`
             );
             await fs.access(outputPath);
             return outputPath;
@@ -292,7 +272,7 @@ const mergeVideoAudio = async (videoPath, audioPath, outputPath) => {
         ffmpeg()
             .input(videoPath)
             .input(audioPath)
-            .outputOptions(['-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', '-shortest'])
+            .outputOptions(['-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', '-shortest'])
             .output(outputPath)
             .on('end', () => resolve(outputPath))
             .on('error', reject)
@@ -555,7 +535,7 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'OK',
         message: 'YouTube Dubbing API is running',
-        translateStatus: translatorAvailable ? 'RapidAPI Connected' : 'Not Connected',
+        translateStatus: 'MyMemory (free, no key required)',
         activeJobs: jobs.size
     });
 });
@@ -569,7 +549,7 @@ ensureDownloadsDir().then(() => {
     app.listen(PORT, () => {
         console.log(`🚀 YouTube Dubbing API server running on port ${PORT}`);
         console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
-        console.log(`🔑 RapidAPI Translator Status: ${translatorAvailable ? '✅ Connected' : '❌ Not Connected'}`);
+        console.log(`🌐 Translation: MyMemory (free, no API key required)`);
     });
 });
 
