@@ -10,7 +10,19 @@ language_code: XTTS language code e.g. "es", "fr", "de"
 speaker_wav:   path to a WAV file (6-30s) of the original speaker
 """
 import sys
+import os
 import json
+
+# Pre-accept the Coqui CPML non-commercial license so the model downloads
+# without an interactive prompt when called from Node.js.
+# Full license: https://coqui.ai/cpml
+os.environ.setdefault("COQUI_TOS_AGREED", "1")
+
+# PyTorch 2.6 changed torch.load default to weights_only=True, which blocks
+# XTTS's custom checkpoint classes. Patch before TTS imports torch.load.
+import torch as _torch
+_orig_load = _torch.load
+_torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': False})
 
 # The `bangla` package 0.0.5 uses `bool | None` union syntax which is Python 3.10+.
 # Pre-register an empty stub so TTS skips its __init__.py entirely on Python 3.9.
