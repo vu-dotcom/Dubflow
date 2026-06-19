@@ -8,7 +8,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 ffmpeg.setFfmpegPath(ffmpegPath);
 const axios = require('axios');
-const { translate } = require('@vitalets/google-translate-api');
+const deepl = require('deepl-node');
 const { v4: uuidv4 } = require('uuid');
 const { exec } = require('child_process');
 const { promisify } = require('util');
@@ -23,28 +23,33 @@ app.use(cors());
 app.use(express.json());
 app.use('/downloads', express.static(path.join(__dirname, 'downloads')));
 
-console.log('✅ Google Translate ready (no API key required)');
-
-// Shared language name → code mappings
-const BASE_LANGUAGE_CODES = {
-    'spanish': 'es', 'french': 'fr', 'german': 'de', 'italian': 'it',
-    'portuguese': 'pt', 'russian': 'ru', 'japanese': 'ja', 'korean': 'ko',
-    'hindi': 'hi', 'arabic': 'ar', 'dutch': 'nl', 'polish': 'pl',
-    'turkish': 'tr', 'swedish': 'sv', 'norwegian': 'no', 'danish': 'da',
-    'finnish': 'fi', 'greek': 'el', 'hebrew': 'he', 'thai': 'th',
-    'vietnamese': 'vi', 'indonesian': 'id', 'malay': 'ms', 'tagalog': 'tl',
-    'urdu': 'ur', 'bengali': 'bn', 'tamil': 'ta', 'telugu': 'te',
-    'marathi': 'mr', 'gujarati': 'gu', 'kannada': 'kn', 'malayalam': 'ml',
-    'punjabi': 'pa'
+// DeepL target language codes — null means DeepL doesn't support it (TTS still works, no translation)
+const DEEPL_LANGUAGE_CODES = {
+    'spanish':    'ES',    'french':     'FR',   'german':    'DE',
+    'italian':    'IT',    'portuguese': 'PT-BR', 'russian':   'RU',
+    'japanese':   'JA',    'korean':     'KO',   'arabic':    'AR',
+    'dutch':      'NL',    'polish':     'PL',   'turkish':   'TR',
+    'swedish':    'SV',    'norwegian':  'NB',   'danish':    'DA',
+    'finnish':    'FI',    'greek':      'EL',   'indonesian':'ID',
+    'romanian':   'RO',    'ukrainian':  'UK',   'bulgarian': 'BG',
+    'czech':      'CS',    'hungarian':  'HU',   'slovak':    'SK',
+    'slovenian':  'SL',    'estonian':   'ET',   'latvian':   'LV',
+    'lithuanian': 'LT',
+    'chinese': 'ZH', 'chinese simplified': 'ZH', 'chinese traditional': 'ZH',
+    // Languages not yet in DeepL — TTS-only (no translation)
+    'hindi': null, 'hebrew': null, 'thai': null, 'vietnamese': null,
+    'malay': null, 'tagalog': null, 'urdu': null, 'bengali': null,
+    'tamil': null, 'telugu': null, 'marathi': null, 'gujarati': null,
+    'kannada': null, 'malayalam': null, 'punjabi': null,
 };
 
-// MyMemory uses zh-CN / zh-TW for Chinese variants
-const TRANSLATION_LANGUAGE_CODES = {
-    ...BASE_LANGUAGE_CODES,
-    'chinese': 'zh-CN',
-    'chinese simplified': 'zh-CN',
-    'chinese traditional': 'zh-TW'
-};
+let deeplTranslator = null;
+if (process.env.DEEPL_API_KEY) {
+    deeplTranslator = new deepl.Translator(process.env.DEEPL_API_KEY);
+    console.log('✅ DeepL translator ready');
+} else {
+    console.warn('⚠️  DEEPL_API_KEY not set — translation will be skipped (add to .env)');
+}
 
 // Edge TTS voice map — Microsoft Azure Neural voices, free via edge-tts
 const EDGE_TTS_VOICES = {
@@ -86,7 +91,8 @@ const EDGE_TTS_VOICES = {
     'punjabi':    'pa-IN-OjasNeural'
 };
 
-const SUPPORTED_LANGUAGES = new Set(Object.keys(TRANSLATION_LANGUAGE_CODES));
+// Any language with a TTS voice can be dubbed (even without translation support)
+const SUPPORTED_LANGUAGES = new Set(Object.keys(EDGE_TTS_VOICES));
 
 // In-memory job store — each entry: { status, step, downloadUrl?, error?, transcriptSegments?, translationErrors?, tempDir }
 const jobs = new Map();
@@ -124,61 +130,33 @@ const extractVideoId = (url) => {
     return match ? match[1] : null;
 };
 
-const translateText = async (text, targetLanguage) => {
-    if (!text || text.trim().length < 2) return text;
-
-    const targetLangCode = TRANSLATION_LANGUAGE_CODES[targetLanguage.toLowerCase()] || targetLanguage.toLowerCase();
-
-    try {
-        const result = await translate(text.trim(), { to: targetLangCode });
-        return result.text || text;
-    } catch (error) {
-        // 429 means Google is throttling — surface it so batchTranslate can back off
-        if (error.name === 'TooManyRequestsError') {
-            throw error;
-        }
-        console.error('Translation error:', error.message);
-        return text;
+const batchTranslateText = async (textArray, targetLanguage) => {
+    if (!deeplTranslator) {
+        console.warn('Translation skipped — DEEPL_API_KEY not configured');
+        return textArray.map(item => ({ ...item, translatedText: item.text }));
     }
-};
 
-const batchTranslateText = async (textArray, targetLanguage, batchSize = 10) => {
+    const targetLangCode = DEEPL_LANGUAGE_CODES[targetLanguage.toLowerCase()];
+    if (!targetLangCode) {
+        console.log(`ℹ️  DeepL doesn't support ${targetLanguage} — using original text`);
+        return textArray.map(item => ({ ...item, translatedText: item.text }));
+    }
+
     try {
-        const results = [];
-
-        for (let i = 0; i < textArray.length; i += batchSize) {
-            const batch = textArray.slice(i, i + batchSize);
-            console.log(`🌐 Processing translation batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(textArray.length / batchSize)}`);
-
-            for (const item of batch) {
-                if (!item.text || item.text.trim().length < 2) {
-                    results.push({ ...item, translatedText: item.text });
-                    continue;
-                }
-
-                try {
-                    const translatedText = await translateText(item.text, targetLanguage);
-                    results.push({ ...item, translatedText });
-                    await new Promise(resolve => setTimeout(resolve, 300));
-                } catch (itemError) {
-                    console.error(`Translation failed for item: "${item.text.substring(0, 50)}..."`, itemError.message);
-                    results.push({ ...item, translatedText: item.text });
-                    // Back off longer if Google is throttling
-                    const delay = itemError.name === 'TooManyRequestsError' ? 5000 : 1000;
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-            }
-
-            if (i + batchSize < textArray.length) {
-                const delayTime = Math.random() * 2000 + 3000;
-                console.log(`⏳ Waiting ${Math.round(delayTime / 1000)}s before next batch to avoid rate limiting...`);
-                await new Promise(resolve => setTimeout(resolve, delayTime));
-            }
-        }
-
-        return results;
+        const texts = textArray.map(item => item.text || '');
+        console.log(`🌐 Translating ${texts.length} segments to ${targetLanguage} via DeepL...`);
+        const results = await deeplTranslator.translateText(texts, null, targetLangCode);
+        console.log('✅ DeepL translation complete');
+        return textArray.map((item, i) => ({
+            ...item,
+            translatedText: results[i]?.text || item.text,
+        }));
     } catch (error) {
-        console.error('Batch translation error:', error.message);
+        if (error.message?.toLowerCase().includes('quota')) {
+            console.error('DeepL monthly quota exceeded — using original text');
+        } else {
+            console.error('DeepL translation error:', error.message);
+        }
         return textArray.map(item => ({ ...item, translatedText: item.text }));
     }
 };
@@ -571,7 +549,7 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'OK',
         message: 'YouTube Dubbing API is running',
-        translateStatus: 'Google Translate (free, no key required)',
+        translateStatus: deeplTranslator ? 'DeepL (500k chars/month free)' : 'DeepL (DEEPL_API_KEY not set)',
         activeJobs: jobs.size
     });
 });
@@ -585,7 +563,7 @@ ensureDownloadsDir().then(() => {
     app.listen(PORT, () => {
         console.log(`🚀 YouTube Dubbing API server running on port ${PORT}`);
         console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
-        console.log(`🌐 Translation: Google Translate (free, no API key required)`);
+        console.log(`🌐 Translation: ${deeplTranslator ? 'DeepL ready' : 'DeepL not configured (add DEEPL_API_KEY to .env)'}`);
     });
 });
 
